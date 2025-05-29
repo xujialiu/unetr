@@ -6,7 +6,7 @@ import time
 
 from torch.utils.data import sampler
 from torch.utils.tensorboard import SummaryWriter
-
+import lr_sched
 from peft import LoraConfig, get_peft_model
 
 sys.path.append("./")
@@ -172,6 +172,25 @@ def main(args):
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
+    encoder_params = []
+    decoder_params = []
+    cls_head_params = []
+
+    for name, param in model.named_parameters():
+        if "decoder" in name:
+            decoder_params.append(param)
+        elif "head" in name:  # 分类头
+            cls_head_params.append(param)
+        else:
+            encoder_params.append(param)
+
+    # 为不同部分设置不同的学习率
+    param_groups = [
+        {"params": encoder_params, "lr": args.lr},
+        {"params": decoder_params, "lr": args.lr * 10},  # 分割解码器使用更高的学习率
+        {"params": cls_head_params, "lr": args.lr},
+    ]
+
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr)
 
     loss_scaler = NativeScaler()
@@ -201,6 +220,8 @@ def main(args):
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
+    
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.50)
 
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train(
@@ -215,98 +236,8 @@ def main(args):
             args.clip_grad,
             log_writer=log_writer,
             args=args,
+            scheduler = scheduler
         )
-
-    # -------
-    # load weights to evaluate
-
-    linear_classifier = linear_classifier.cuda()
-    linear_classifier = nn.parallel.DistributedDataParallel(
-        linear_classifier, device_ids=[args.gpu]
-    )
-    # set optimizer
-    parameters = linear_classifier.parameters()
-    optimizer = torch.optim.AdamW(
-        parameters,
-        args.lr,  # linear scaling rule
-        betas=(0.9, 0.999),
-        weight_decay=0.05,
-    )
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.50)
-
-    # Optionally resume from a checkpoint
-    to_restore = {"epoch": 0, "best_dice": 0.0}
-    if args.load_from:
-        utils.restart_from_checkpoint(
-            # os.path.join(args.output_dir, args.load_from),
-            args.load_from,
-            run_variables=to_restore,
-            state_dict=linear_classifier,
-            optimizer=optimizer,
-            scheduler=scheduler,
-        )
-    start_epoch = to_restore["epoch"]
-    best_dice = to_restore["best_dice"]
-    print(f"start epoch : {start_epoch} & end epoch: {args.epochs}")
-
-    for epoch in range(start_epoch, args.epochs):
-        train_loader.sampler.set_epoch(epoch)
-        model.eval()
-
-        linear_classifier.train()
-        train_stats = train(
-            model,
-            linear_classifier,
-            optimizer,
-            train_loader,
-            epoch,
-        )
-        # scheduler.step()
-        # print("start schedule....")
-
-        log_stats = {
-            **{f"train_{k}": v for k, v in train_stats.items()},
-            "epoch": epoch,
-        }
-        if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
-            linear_classifier.eval()
-            test_stats = validate_network_all(val_loader, model, linear_classifier)
-            all_dice = test_stats["metric_dice"]
-
-            print(
-                f"Mean dice at epoch {epoch} of the network on the {len(dataset_val)} test images: {all_dice:.4f}"
-            )
-            log_stats = {
-                **{k: v for k, v in log_stats.items()},
-                **{f"test_{k}": v for k, v in test_stats.items()},
-            }
-
-            if utils.is_main_process() and (all_dice >= best_dice):
-                # always only save best checkpoint till now
-                with (Path(args.output_dir) / "log.txt").open("a") as f:
-                    f.write(json.dumps(log_stats) + "\n")
-
-                save_dict = {
-                    "epoch": epoch + 1,
-                    "state_dict": linear_classifier.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "best_dice": all_dice,
-                }
-                torch.save(
-                    save_dict,
-                    os.path.join(
-                        args.output_dir, "checkpoint_{}_linear.pth".format(epoch)
-                    ),
-                )
-
-            best_dice = max(best_dice, all_dice)
-            print(f"Max dice so far: {best_dice:.4f}")
-    print(
-        "Training of the supervised segmentation decoder on frozen features completed.\nAnd the best dice: {dice:.4f}".format(
-            dice=best_dice
-        )
-    )
 
 
 def train(
@@ -321,6 +252,7 @@ def train(
     max_norm=0,
     log_writer=None,
     args=None,
+    scheduler=None,
 ):
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
@@ -335,6 +267,14 @@ def train(
             header,
         )
     ):
+
+        # we use a per iteration (instead of per epoch) lr scheduler
+        if data_iter_step % accum_iter == 0:
+            # lr_sched.adjust_learning_rate(
+            #     optimizer, data_iter_step / len(data_loader) + epoch, args
+            # )
+            scheduler.step()
+
         # move to gpu
         inputs = inputs.to(device=device, non_blocking=True)
         masks = masks.to(device=device, non_blocking=True)
@@ -344,7 +284,8 @@ def train(
             outputs_cls, outputs_seg = model(inputs)
             loss_cls = criterion_cls(outputs_cls, labels)
             loss_seg = criterion_seg(outputs_seg, masks)
-            loss = loss_cls + loss_seg
+            # loss = loss_cls + 100 * loss_seg
+            loss = loss_seg
 
         loss_value = loss.item()
         loss /= accum_iter
@@ -360,7 +301,9 @@ def train(
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
 
-        metric_logger.update(loss=loss_value)
+        metric_logger.update(
+            loss=loss_value, loss_cls=loss_cls.item(), loss_seg=loss_seg.item()
+        )
         min_lr = 10.0
         max_lr = 0.0
 

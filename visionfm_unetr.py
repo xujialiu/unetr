@@ -115,6 +115,7 @@ class UnetrHead(nn.Module):
         self.cls = nn.Conv2d(
             self.base_channel // 2, self.num_classes, kernel_size=1, padding=0
         )
+        self.apply(self._init_weights)
 
     def _reshape_output(self, x):
         # [1, 197, 1024], [1, 197, 768], [B, seq_len, embed_dim] -> [B, C, 14, 14]
@@ -164,6 +165,15 @@ class UnetrHead(nn.Module):
         output = self.cls(x)  # [B, C, H, W]
 
         return output
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+            nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
 
 
 if __name__ == "__main__":

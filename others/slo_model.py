@@ -12,9 +12,6 @@ from einops import rearrange
 from util.pos_embed import get_3d_sincos_pos_embed
 
 
-
-
-
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
     def __init__(
         self,

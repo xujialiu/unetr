@@ -220,7 +220,7 @@ def main(args):
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    
+
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.50)
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -236,7 +236,7 @@ def main(args):
             args.clip_grad,
             log_writer=log_writer,
             args=args,
-            scheduler = scheduler
+            scheduler=scheduler,
         )
 
 

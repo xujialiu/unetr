@@ -44,6 +44,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
 
+COLOR = (125, 125, 125), (255, 0, 0), (0, 255, 0), (0, 0, 255)
+
 
 def plot_cm(ground_truths, predictions, save_path):
     cm = confusion_matrix(ground_truths, predictions)
@@ -227,7 +229,7 @@ def main(args):
     # 为不同部分设置不同的学习率
     param_groups = [
         {"params": encoder_params, "lr": args.lr},
-        {"params": decoder_params, "lr": args.lr * 10},  # 分割解码器使用更高的学习率
+        {"params": decoder_params, "lr": args.lr},  # 分割解码器使用更高的学习率
         {"params": cls_head_params, "lr": args.lr},
     ]
 
@@ -243,20 +245,16 @@ def main(args):
     device = args.device
 
     if args.eval:
-        # (
-        #     test_stats,
-        #     test_auc_roc,
-        #     test_acc,
-        #     (test_output_loss_total, test_output_loss_un, test_output_loss_ce),
-        # ) = evaluate(
-        #     args=args,
-        #     data_loader=data_loader_test,
-        #     model=model,
-        #     device=device,
-        #     epoch=0,
-        #     mode="test",
-        #     num_class=args.nb_classes,
-        # )
+        test(
+            model,
+            criterion_cls,
+            criterion_seg,
+            val_loader,
+            device,
+            mode="val",
+            log_writer=log_writer,
+            args=args,
+        )
 
         # exit(0)
         pass
@@ -324,7 +322,10 @@ def train(
     print_freq = 10
     accum_iter = args.accum_iter
 
-    for data_iter_step, (inputs, masks, labels, file_name) in enumerate(
+    image_count = 0
+    max_images = 5
+
+    for data_iter_step, (inputs, masks, labels, file_names) in enumerate(
         metric_logger.log_every(
             data_loader,
             print_freq,
@@ -345,6 +346,45 @@ def train(
 
         with torch.amp.autocast("cuda"):
             outputs_cls, outputs_seg = model(inputs)
+
+            # ------------------------------------
+
+            if (labels.max() >= 3) and (
+                image_count < max_images
+            ):  # 保存前5个batch的结果
+                idx = torch.argmax(labels)
+
+                save_path = args.metrics_path / f"train_visualizations_epoch_{epoch}"
+                save_path.mkdir(exist_ok=True, parents=True)
+
+                # 保存原图、真实mask、预测mask
+                fig, axes = plt.subplots(2, args.nb_classes_seg + 1, figsize=(20, 8))
+
+                # 原图
+                img = inputs[idx].cpu().numpy().transpose(1, 2, 0)
+                mean, std = [
+                    (0.423737496137619, 0.2609460651874542, 0.128403902053833),
+                    (0.29482534527778625, 0.20167365670204163, 0.13668020069599152),
+                ]
+                img = (img * std + mean).clip(0, 1)
+                axes[0, 0].imshow(img)
+                axes[0, 0].set_title("Input Image")
+
+                # 显示4个类别的mask
+                for i in range(args.nb_classes_seg):
+                    axes[0, i + 1].imshow(masks[idx, i].cpu(), cmap="gray")
+                    axes[0, i + 1].set_title(f"GT Mask {args.mask_folder_names[i]}")
+
+                    pred = torch.sigmoid(outputs_seg[idx, i]).cpu() > 0.5
+                    axes[1, i + 1].imshow(pred, cmap="gray")
+                    axes[1, i + 1].set_title(f"Pred Mask {args.mask_folder_names[i]}")
+
+                plt.tight_layout()
+                plt.savefig(save_path / f"sample_{file_names[idx]}.png")
+                plt.close()
+                image_count += 1
+            # ------------------------------------
+
             loss_cls = criterion_cls(outputs_cls, labels)
             loss_seg = criterion_seg(outputs_seg, masks)
             # loss = loss_cls + 100 * loss_seg
@@ -395,12 +435,11 @@ def test(
     criterion_seg,
     data_loader,
     device,
-    epoch,
     mode="val",
     log_writer=None,
     args=None,
 ):
-    
+
     model.eval()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -414,36 +453,62 @@ def test(
     list_loss_cls = []
     list_loss_seg = []
     list_loss_totals = []
-    
-    criterion_cls = nn.CrossEntropyLoss(reduction='none')
+
+    criterion_cls = nn.CrossEntropyLoss(reduction="none")
     criterion_seg = DiceFocalLoss(
         sigmoid=True,
         reduction="none",
     )
-    
-    
-    
-    
+
     # switch to evaluation mode
 
-    for data_iter_step, (inputs, masks, labels, file_name) in enumerate(
+    for data_iter_step, (inputs, masks, labels, file_names) in enumerate(
         metric_logger.log_every(data_loader, 10, header)
     ):
-        
+
         ouput_path = Path(args.result_root_path) / args.result_name / "image_with_mask"
-        
+
         if not ouput_path.exists():
             ouput_path.mkdir(parents=True, exist_ok=True)
-        
+
+        inputs = inputs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         # compute output
         with torch.cuda.amp.autocast():
             output_cls, ouputs_seg = model(inputs)
-            
+
         batch_size = inputs.shape[0]
         for idx in range(batch_size):
-            
+            file_path = Path(args.data_path) / "image" / file_names[idx]
 
-    
+            import cv2
+            from skimage import io
+
+            img = cv2.imread(file_path)
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            for mask_idx, mask_name in enumerate(args.mask_folder_names):
+
+                mask = ouputs_seg[idx, mask_idx]
+                mask = torch.sigmoid(mask)
+
+                mask = asnumpy(mask).astype(np.float32)
+
+                mask = cv2.resize(
+                    mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_CUBIC
+                )
+                mask = mask > 0.5
+                mask = (mask * 255).astype(np.uint8)
+                # _, mask = cv2.threshold(mask, 0.5, 1, cv2.THRESH_BINARY)
+
+                contours, _ = cv2.findContours(
+                    mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(img, contours, -1, COLOR[mask_idx], 2)
+
+            img_output_path = ouput_path / file_names[idx]
+            io.imsave(img_output_path, img)
 
 
 @torch.no_grad()
@@ -471,16 +536,19 @@ def evaluate(
     list_loss_cls = []
     list_loss_seg = []
     list_loss_totals = []
-    
-    criterion_cls = nn.CrossEntropyLoss(reduction='none')
+
+    criterion_cls = nn.CrossEntropyLoss(reduction="none")
     criterion_seg = DiceFocalLoss(
         sigmoid=True,
         reduction="none",
     )
+    
+    image_count = 0
+    max_images = 5
 
     # switch to evaluation mode
 
-    for data_iter_step, (inputs, masks, labels, file_name) in enumerate(
+    for data_iter_step, (inputs, masks, labels, file_names) in enumerate(
         metric_logger.log_every(data_loader, 10, header)
     ):
 
@@ -490,10 +558,45 @@ def evaluate(
 
         # compute output
         with torch.cuda.amp.autocast():
-            output_cls, ouputs_seg = model(inputs)
+            output_cls, outputs_seg = model(inputs)
+
+            # ------------------------------------
+            if (labels.max() >= 3) and (image_count < max_images):  # 保存前5个batch的结果
+                idx = torch.argmax(labels)
+
+                save_path = args.metrics_path / f"visualizations_epoch_{epoch}"
+                save_path.mkdir(exist_ok=True, parents=True)
+
+                # 保存原图、真实mask、预测mask
+                fig, axes = plt.subplots(2, args.nb_classes_seg + 1, figsize=(20, 8))
+
+                # 原图
+                img = inputs[idx].cpu().numpy().transpose(1, 2, 0)
+                mean, std = [
+                    (0.423737496137619, 0.2609460651874542, 0.128403902053833),
+                    (0.29482534527778625, 0.20167365670204163, 0.13668020069599152),
+                ]
+                img = (img * std + mean).clip(0, 1)
+                axes[0, 0].imshow(img)
+                axes[0, 0].set_title("Input Image")
+
+                # 显示4个类别的mask
+                for i in range(args.nb_classes_seg):
+                    axes[0, i + 1].imshow(masks[idx, i].cpu(), cmap="gray")
+                    axes[0, i + 1].set_title(f"GT Mask {args.mask_folder_names[i]}")
+
+                    pred = torch.sigmoid(outputs_seg[idx, i]).cpu() > 0.5
+                    axes[1, i + 1].imshow(pred, cmap="gray")
+                    axes[1, i + 1].set_title(f"Pred Mask {args.mask_folder_names[i]}")
+
+                plt.tight_layout()
+                plt.savefig(save_path / f"sample_{file_names[idx]}.png")
+                plt.close()
+                image_count += 1
+            # ------------------------------------
 
             loss_cls = criterion_cls(output_cls, labels)
-            loss_seg = criterion_seg(ouputs_seg, masks).mean(dim=(1, 2, 3))
+            loss_seg = criterion_seg(outputs_seg, masks).mean(dim=(1, 2, 3))
             loss = loss_seg + loss_cls
 
             output_cls_prob = F.softmax(output_cls, dim=-1)
@@ -502,7 +605,7 @@ def evaluate(
             batch_size = inputs.shape[0]
 
             for idx in range(batch_size):
-                list_names.append(file_name[idx])
+                list_names.append(file_names[idx])
                 list_labels.append(asnumpy(labels)[idx])
                 list_outputs_cls.append(asnumpy(output_cls)[idx])
                 list_outputs_cls_prob.append(asnumpy(output_cls_prob)[idx])

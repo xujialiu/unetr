@@ -119,7 +119,7 @@ class UnetrHead(nn.Module):
 
     def _reshape_output(self, x):
         # [1, 197, 1024], [1, 197, 768], [B, seq_len, embed_dim] -> [B, C, 14, 14]
-        h = w = int(self.img_dim / self.patch_dim)
+        h = w = int(x.shape[1] ** 0.5)
         x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w)
         return x
 

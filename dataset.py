@@ -26,75 +26,83 @@ def build_transform(is_train, mean=[0, 0, 0], std=[1, 1, 1], img_size=224):
 
     if is_train == "train":
 
-        # transform = [
-        #     # 调整大小
-        #     A.Resize(height=img_size, width=img_size, interpolation=cv2.INTER_CUBIC),
-        #     # 几何变换
-        #     A.HorizontalFlip(p=0.5),
-        #     A.VerticalFlip(p=0.5),
-        #     A.RandomRotate90(p=0.5),
-        #     # 仿射变换
-        #     A.ShiftScaleRotate(
-        #         shift_limit=0.1,
-        #         scale_limit=0.2,
-        #         rotate_limit=30,
-        #         interpolation=cv2.INTER_CUBIC,
-        #         border_mode=cv2.BORDER_CONSTANT,
-        #         value=0,
-        #         mask_value=0,
-        #         p=0.5,
-        #     ),
-        #     # 弹性变换（对医学图像特别有用）
-        #     A.ElasticTransform(
-        #         alpha=120,
-        #         sigma=120 * 0.05,
-        #         alpha_affine=120 * 0.03,
-        #         interpolation=cv2.INTER_CUBIC,
-        #         border_mode=cv2.BORDER_CONSTANT,
-        #         value=0,
-        #         mask_value=0,
-        #         p=0.3,
-        #     ),
-        #     # 网格畸变
-        #     A.GridDistortion(
-        #         num_steps=5,
-        #         distort_limit=0.3,
-        #         interpolation=cv2.INTER_CUBIC,
-        #         border_mode=cv2.BORDER_CONSTANT,
-        #         value=0,
-        #         mask_value=0,
-        #         p=0.3,
-        #     ),
-        #     # 色彩增强（仅应用于图像，不影响mask）
-        #     A.OneOf(
-        #         [
-        #             A.RandomBrightnessContrast(
-        #                 brightness_limit=0.2, contrast_limit=0.2, p=1
-        #             ),
-        #             A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=1),
-        #             A.RandomGamma(gamma_limit=(80, 120), p=1),
-        #         ],
-        #         p=0.5,
-        #     ),
-        #     # 噪声
-        #     A.OneOf(
-        #         [
-        #             A.GaussNoise(var_limit=(10.0, 50.0), p=1),
-        #             A.GaussianBlur(blur_limit=(3, 7), p=1),
-        #             A.MedianBlur(blur_limit=5, p=1),
-        #         ],
-        #         p=0.3,
-        #     ),
-        #     # 归一化
-        #     A.Normalize(mean=mean, std=std),
-        #     # 转换为PyTorch张量
-        #     ToTensorV2(),
-        # ]
         transform = [
-            A.Resize(height=img_size, width=img_size, interpolation=cv2.INTER_CUBIC),
+            
+            # 几何变换
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            # 仿射变换
+            A.ShiftScaleRotate(
+                shift_limit=0.1,
+                scale_limit=0.2,
+                rotate_limit=30,
+                interpolation=cv2.INTER_CUBIC,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+                mask_value=0,
+                p=0.5,
+            ),
+            # 弹性变换（对医学图像特别有用）
+            A.ElasticTransform(
+                alpha=120,
+                sigma=120 * 0.05,
+                alpha_affine=120 * 0.03,
+                interpolation=cv2.INTER_CUBIC,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+                mask_value=0,
+                p=0.3,
+            ),
+            # 网格畸变
+            A.GridDistortion(
+                num_steps=5,
+                distort_limit=0.3,
+                interpolation=cv2.INTER_CUBIC,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+                mask_value=0,
+                p=0.3,
+            ),
+            
+            # 调整大小
+            A.RandomResizedCrop(
+                height=img_size,
+                width=img_size,
+                scale=(0.3, 1.0),
+                ratio=(0.75, 1.3333),
+                interpolation=cv2.INTER_CUBIC,
+            ),
+            # 色彩增强（仅应用于图像，不影响mask）
+            A.OneOf(
+                [
+                    A.RandomBrightnessContrast(
+                        brightness_limit=0.2, contrast_limit=0.2, p=1
+                    ),
+                    A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=1),
+                    A.RandomGamma(gamma_limit=(80, 120), p=1),
+                ],
+                p=0.5,
+            ),
+            # 噪声
+            A.OneOf(
+                [
+                    A.GaussNoise(var_limit=(10.0, 50.0), p=1),
+                    A.GaussianBlur(blur_limit=(3, 7), p=1),
+                    A.MedianBlur(blur_limit=5, p=1),
+                ],
+                p=0.3,
+            ),
+            # 归一化
             A.Normalize(mean=mean, std=std),
+            # 转换为PyTorch张量
             ToTensorV2(),
         ]
+        # transform = [
+        #     A.Resize(height=img_size, width=img_size, interpolation=cv2.INTER_CUBIC),
+        #     A.Normalize(mean=mean, std=std),
+        #     ToTensorV2(),
+        # ]
     else:
         transform = [
             A.Resize(height=img_size, width=img_size, interpolation=cv2.INTER_CUBIC),
@@ -147,7 +155,7 @@ class MyDataset(Dataset):
 
         # img = io.imread(img_path)
         # list_mask = [io.imread(mask_path, as_gray=True) > 0 for mask_path in mask_paths]
-        
+
         # Replace io.imread with cv2 for faster loading
         img = cv2.imread(str(img_path))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -157,7 +165,7 @@ class MyDataset(Dataset):
         for mask_path in mask_paths:
             mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
             list_mask.append(mask > 0)
-            
+
         mask = np.stack(list_mask, axis=2).astype(np.float32)
 
         if self.transform:
@@ -167,7 +175,7 @@ class MyDataset(Dataset):
 
         # img.shape: (B, c, 224, 224), mask.shape: (B, 224, 224, 4)
         mask = rearrange(mask, "h w c -> c h w")
-        
+
         return img, mask, label, file_name
 
     def __len__(self):

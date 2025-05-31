@@ -20,6 +20,10 @@ import torch.backends.cudnn as cudnn
 
 import utils
 from pathlib import Path
+import torch.nn.functional as F
+from einops import asnumpy
+import pandas as pd
+from sklearn import metrics
 
 
 # import transforms as self_transforms
@@ -35,11 +39,32 @@ import misc
 from vitunetr import vit_unetr_base, vit_unetr_large
 from misc import NativeScalerWithGradNormCount as NativeScaler
 
+from monai.losses.dice import DiceLoss, DiceFocalLoss
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
+
+
+def plot_cm(ground_truths, predictions, save_path):
+    cm = confusion_matrix(ground_truths, predictions)
+    cm_percent = cm.astype("float") / cm.sum(axis=1)[:, np.newaxis] * 100
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    sns.heatmap(cm_percent, annot=True, fmt=".1f", cmap="Blues", ax=ax)
+
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Confusion Matrix (Percentage)")
+
+    fig.savefig(save_path)
+
 
 def main(args):
     misc.setup_print()
     result_path = Path(args.result_root_path) / args.result_name
     output_path = result_path / args.output_dir
+    args.metrics_path = result_path / args.metrics_folder
 
     print(f"{args}".replace(", ", ",\n"))
 
@@ -82,7 +107,7 @@ def main(args):
         data_path=args.data_path,
         mask_folder_names=args.mask_folder_names,
         is_train="val",
-        transform=train_transform,
+        transform=val_transform,
     )
     print(f"Class counts: {dataset_train.class_counts}")
 
@@ -105,6 +130,7 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=True,
     )
+
     print(
         f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs."
     )
@@ -166,6 +192,20 @@ def main(args):
         msg = model.encoder.load_state_dict(checkpoint_model, strict=False)
         print(f"{msg=}")
 
+    for name, param in model.named_parameters():
+        if name.startswith("encoder"):
+            if "lora" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        elif name.startswith("decoder") or ("head" in name):
+            param.requires_grad = True
+
+    print("Trainable parameters:")
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            print(name)
+
     param_groups = model.parameters()
 
     eff_batch_size = args.batch_size * args.accum_iter
@@ -196,7 +236,10 @@ def main(args):
     loss_scaler = NativeScaler()
 
     criterion_cls = nn.CrossEntropyLoss()
-    criterion_seg = MultiLabelSegmentationLoss()
+    criterion_seg = DiceFocalLoss(
+        sigmoid=True,
+        reduction="mean",
+    )
     device = args.device
 
     if args.eval:
@@ -219,12 +262,11 @@ def main(args):
         pass
 
     print(f"Start training for {args.epochs} epochs")
-    start_time = time.time()
 
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.50)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.50)
 
     for epoch in range(args.start_epoch, args.epochs):
-        train_stats = train(
+        train(
             model,
             criterion_cls,
             criterion_seg,
@@ -236,8 +278,30 @@ def main(args):
             args.clip_grad,
             log_writer=log_writer,
             args=args,
-            scheduler=scheduler,
         )
+
+        evaluate(
+            model,
+            criterion_cls,
+            criterion_seg,
+            val_loader,
+            device,
+            epoch,
+            mode="val",
+            log_writer=log_writer,
+            args=args,
+        )
+
+        if args.output_dir:
+            to_save = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": epoch,
+                "scaler": loss_scaler.state_dict(),
+                "args": args,
+            }
+            checkpoint_path = output_path / f"checkpoint_{epoch}.pth"
+            torch.save(to_save, checkpoint_path)
 
 
 def train(
@@ -252,8 +316,8 @@ def train(
     max_norm=0,
     log_writer=None,
     args=None,
-    scheduler=None,
 ):
+    model.train()
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header = "Epoch: [{}]".format(epoch)
@@ -269,16 +333,15 @@ def train(
     ):
 
         # we use a per iteration (instead of per epoch) lr scheduler
-        if data_iter_step % accum_iter == 0:
-            # lr_sched.adjust_learning_rate(
-            #     optimizer, data_iter_step / len(data_loader) + epoch, args
-            # )
-            scheduler.step()
+        # if data_iter_step % accum_iter == 0:
+        #     lr_sched.adjust_learning_rate(
+        #         optimizer, data_iter_step / len(data_loader) + epoch, args
+        #     )
 
-        # move to gpu
-        inputs = inputs.to(device=device, non_blocking=True)
-        masks = masks.to(device=device, non_blocking=True)
-        labels = labels.to(device=device, non_blocking=True)
+        # move to device
+        inputs = inputs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda"):
             outputs_cls, outputs_seg = model(inputs)
@@ -323,80 +386,224 @@ def train(
             log_writer.add_scalar("lr", max_lr, epoch_1000x)
 
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 @torch.no_grad()
-def validate_network_all(val_loader, model, linear_classifier):
-    # compute the metrics on all data, instead of batch style
-    linear_classifier.eval()
-    metric_logger = utils.MetricLogger(delimiter="  ")
+def test(
+    model,
+    criterion_cls,
+    criterion_seg,
+    data_loader,
+    device,
+    epoch,
+    mode="val",
+    log_writer=None,
+    args=None,
+):
+    
+    model.eval()
+
+    metric_logger = misc.MetricLogger(delimiter="  ")
     header = "Test:"
 
-    predictions, targets, all_positives, all_img_paths = [], [], [], []
-    for inp, target, extras in metric_logger.log_every(val_loader, 20, header):
-        # move to gpu
-        inp = inp.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True).unsqueeze(dim=1)
+    list_names = []
+    list_labels = []
+    list_outputs_cls_prob = []
+    list_outputs_cls = []
 
-        # forward
-        with torch.no_grad():
-            n = len(model.blocks)  # get all the layers
-            if n == 12:
-                selected_levels = [3, 5, 7, 11]  # for default vit-base model
-            elif n == 24:  # for vit-large
-                selected_levels = [5, 11, 17, 23]
-            else:
-                raise NotImplementedError  # please set suitable selected_levels
-            intermediate_output = model.get_intermediate_layers(inp, n)
-            # only retain the patch token in 4 levels
-            features = [intermediate_output[idx][:, 1:] for idx in selected_levels]
+    list_loss_cls = []
+    list_loss_seg = []
+    list_loss_totals = []
+    
+    criterion_cls = nn.CrossEntropyLoss(reduction='none')
+    criterion_seg = DiceFocalLoss(
+        sigmoid=True,
+        reduction="none",
+    )
+    
+    
+    
+    
+    # switch to evaluation mode
 
-            output = linear_classifier(features, inp)  # [B, 1, H, W]
-            # output = linear_classifier(output)  # [B, 1, H, W]
-            num_classes = output.shape[1]
-            if num_classes == 1:  # for binary segmentation task
-                loss = DiceFocalLoss(sigmoid=True)(output, target)  # B1HW and B1HW
-            else:
-                loss = DiceFocalLoss(softmax=True, to_onehot_y=True)(
-                    output, target
-                )  # BCHW and BCHW
+    for data_iter_step, (inputs, masks, labels, file_name) in enumerate(
+        metric_logger.log_every(data_loader, 10, header)
+    ):
+        
+        ouput_path = Path(args.result_root_path) / args.result_name / "image_with_mask"
+        
+        if not ouput_path.exists():
+            ouput_path.mkdir(parents=True, exist_ok=True)
+        
+        # compute output
+        with torch.cuda.amp.autocast():
+            output_cls, ouputs_seg = model(inputs)
+            
+        batch_size = inputs.shape[0]
+        for idx in range(batch_size):
+            
 
-        predictions.append(output.cpu())
-        targets.append(target.cpu())
-        all_img_paths += extras["img_path"]
+    
 
-    predictions = torch.cat(predictions, dim=0)  # [N, 4, H, W]
-    targets = torch.cat(targets, dim=0)  # [N, C, H, W]
-    batch_size = predictions.shape[0]
-    num_classes = predictions.shape[1]
 
-    if num_classes == 1:
-        dices = utils.dice(
-            torch.sigmoid(predictions.squeeze(dim=1)),
-            targets.squeeze(dim=1),
-            return_ori=True,
+@torch.no_grad()
+def evaluate(
+    model,
+    criterion_cls,
+    criterion_seg,
+    data_loader,
+    device,
+    epoch,
+    mode="val",
+    log_writer=None,
+    args=None,
+):
+    model.eval()
+
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    header = "Test:"
+
+    list_names = []
+    list_labels = []
+    list_outputs_cls_prob = []
+    list_outputs_cls = []
+
+    list_loss_cls = []
+    list_loss_seg = []
+    list_loss_totals = []
+    
+    criterion_cls = nn.CrossEntropyLoss(reduction='none')
+    criterion_seg = DiceFocalLoss(
+        sigmoid=True,
+        reduction="none",
+    )
+
+    # switch to evaluation mode
+
+    for data_iter_step, (inputs, masks, labels, file_name) in enumerate(
+        metric_logger.log_every(data_loader, 10, header)
+    ):
+
+        inputs = inputs.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # compute output
+        with torch.cuda.amp.autocast():
+            output_cls, ouputs_seg = model(inputs)
+
+            loss_cls = criterion_cls(output_cls, labels)
+            loss_seg = criterion_seg(ouputs_seg, masks).mean(dim=(1, 2, 3))
+            loss = loss_seg + loss_cls
+
+            output_cls_prob = F.softmax(output_cls, dim=-1)
+            output_cls = output_cls.argmax(dim=-1)
+
+            batch_size = inputs.shape[0]
+
+            for idx in range(batch_size):
+                list_names.append(file_name[idx])
+                list_labels.append(asnumpy(labels)[idx])
+                list_outputs_cls.append(asnumpy(output_cls)[idx])
+                list_outputs_cls_prob.append(asnumpy(output_cls_prob)[idx])
+                list_loss_cls.append(asnumpy(loss_cls)[idx])
+                list_loss_seg.append(asnumpy(loss_seg)[idx])
+                list_loss_totals.append(asnumpy(loss)[idx])
+
+        acc = metrics.accuracy_score(asnumpy(labels), asnumpy(output_cls))
+
+        metric_logger.update(
+            loss=loss.mean().item(),
+            loss_cls=loss_cls.mean().item(),
+            loss_seg=loss_seg.mean().item(),
         )
-        metric_dice = dices.mean()
-    else:
-        dices_ori = utils.dice_mc(
-            torch.softmax(input=predictions, dim=1),
-            targets.squeeze(dim=1),
-            n_classes=num_classes,
-            return_ori=True,
-        )  # [N, 4]
-        metric_dice = dices_ori.mean(axis=0).mean()
+        metric_logger.meters["acc"].update(acc, n=batch_size)
 
-    # batch_size = inp.shape[0]
-    metric_logger.update(loss=loss.item())
-    metric_logger.meters["metric_dice"].update(metric_dice, n=batch_size)
+    if not args.metrics_path.exists():
+        args.metrics_path.mkdir(parents=True, exist_ok=True)
+
+    # save results, xujia
+    pd.DataFrame(
+        {
+            "names": list_names,
+            "labels": list_labels,
+            "outputs": list_outputs_cls,
+            "outputs_prob": list_outputs_cls_prob,
+            "loss_cls": list_loss_cls,
+            "loss_seg": list_loss_seg,
+            "loss_total": list_loss_totals,
+        }
+    ).to_csv(args.metrics_path / f"results_{epoch}.csv")
+
+    list_outputs_cls = list_outputs_cls
+    if args.nb_classes_cls > 2:
+        try:
+            auc_macro = metrics.roc_auc_score(
+                list_labels, list_outputs_cls_prob, multi_class="ovr", average="macro"
+            )
+        except ValueError:
+            auc_macro = 0.0
+
+        kappa = metrics.cohen_kappa_score(
+            list_labels, list_outputs_cls, weights="quadratic"
+        )
+        accuracy = metrics.accuracy_score(list_labels, list_outputs_cls)
+        f1 = metrics.f1_score(list_labels, list_outputs_cls, average="macro")
+        precision = metrics.precision_score(
+            list_labels, list_outputs_cls, average="macro"
+        )
+        sensitivity = metrics.recall_score(
+            list_labels, list_outputs_cls, average="macro"
+        )
+    else:
+        list_outputs_cls_prob = [output[1] for output in list_outputs_cls_prob]
+
+        try:
+            auc_macro = metrics.roc_auc_score(
+                list_labels,
+                list_outputs_cls_prob,
+            )
+        except ValueError:
+            auc_macro = 0.0
+
+        kappa = metrics.cohen_kappa_score(list_labels, list_outputs_cls)
+        accuracy = metrics.accuracy_score(list_labels, list_outputs_cls)
+        f1 = metrics.f1_score(list_labels, list_outputs_cls)
+        precision = metrics.precision_score(list_labels, list_outputs_cls)
+        sensitivity = metrics.recall_score(list_labels, list_outputs_cls)
+
+    output_loss_total = np.mean(list_loss_totals)
+    output_loss_cls = np.mean(list_loss_cls)
+    output_loss_seg = np.mean(list_loss_seg)
+
+    cm_path = args.metrics_path / f"cm_{epoch}.png"
+    plot_cm(list_labels, list_outputs_cls, cm_path)
+
+    with open(
+        os.path.join(args.metrics_path, "metrics.csv"),
+        "a+",
+    ) as txt:
+        if epoch == 0:
+            txt.write(
+                f"Mode,Epoch,AUC_macro,F1,Kappa,Accuracy,Precision,Sensitivity,Loss,Loss_cls,loss_seg\n"
+            )
+
+        txt.write(
+            f"{mode},{epoch},{auc_macro},{f1},{kappa},{accuracy},{precision},{sensitivity},{output_loss_total},{output_loss_cls},{output_loss_seg}\n"
+        )
 
     print(
-        "* Dice {metric_dice.global_avg:.4f}  Loss {loss.global_avg:.4f}".format(
-            metric_dice=metric_logger.metric_dice, loss=metric_logger.loss
-        )
+        f"{mode} Epoch {epoch}: AUC macro: {auc_macro}, F1: {f1}, Kappa: {kappa}, Accuracy: {accuracy}, Precision: {precision}, Sensitivity: {sensitivity}, Loss: {output_loss_total}, Loss_cls: {output_loss_cls}, Loss_seg: {output_loss_seg}\n"
     )
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    torch.cuda.empty_cache()
+
+    if log_writer is not None:
+        log_writer.add_scalar("perf/val_acc", accuracy, epoch)
+        log_writer.add_scalar("perf/val_auc", auc_macro, epoch)
+
+        log_writer.add_scalar("perf/val_total_loss", output_loss_total, epoch)
+        log_writer.add_scalar("perf/val_loss_cls", output_loss_cls, epoch)
+        log_writer.add_scalar("perf/val_loss_seg", output_loss_seg, epoch)
 
 
 def get_args_parser():

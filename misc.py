@@ -288,7 +288,9 @@ class NativeScalerWithGradNormCount:
                 self._scaler.unscale_(
                     optimizer
                 )  # unscale the gradients of optimizer's assigned params in-place
-                norm = torch.nn.utils.clip_grad_norm_(parameters, clip_grad)
+                norm = torch.nn.utils.clip_grad_norm_(
+                    parameters, clip_grad, error_if_nonfinite=True
+                )
             else:
                 self._scaler.unscale_(optimizer)
                 norm = get_grad_norm_(parameters)
@@ -407,12 +409,12 @@ def all_reduce_mean(x):
 
 def setup_print():
     builtin_print = builtins.print
-    
+
     def print(*args, **kwargs):
         force = kwargs.pop("force", False)
 
         now = datetime.datetime.now().time()
         builtin_print("[{}] ".format(now), end="")  # print with time stamp
         builtin_print(*args, **kwargs)
-        
+
     builtins.print = print

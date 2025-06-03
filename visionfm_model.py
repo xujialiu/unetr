@@ -489,18 +489,19 @@ if __name__ == "__main__":
         print(
             "torch.save({'model': model.state_dict(), 'epoch': epoch}, checkpoint_path)"
         )
-    
+
     from peft import LoraConfig, get_peft_model
+
     config_lora = LoraConfig(
-            r=4,  # LoRA的秩
-            lora_alpha=8,  # LoRA的alpha参数, scaling=alpha/r
-            target_modules=["qkv"],  # 需要应用LoRA的模块名称
-            # target_modules="all-linear",
-            lora_dropout=0.1,
-            bias=None,
-            task_type="FEATURE_EXTRACTION",
-            # task_type="CAUSAL_LM"
-        )
+        r=4,  # LoRA的秩
+        lora_alpha=8,  # LoRA的alpha参数, scaling=alpha/r
+        target_modules=["qkv"],  # 需要应用LoRA的模块名称
+        # target_modules="all-linear",
+        lora_dropout=0.1,
+        bias=None,
+        task_type="FEATURE_EXTRACTION",
+        # task_type="CAUSAL_LM"
+    )
     get_peft_model(model, config_lora)
 
     # 测试不同输入尺寸（测试位置编码插值）

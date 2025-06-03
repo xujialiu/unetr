@@ -379,9 +379,8 @@ def train(
         list_loss_seg = []
         list_loss_totals = []
 
-        # with torch.amp.autocast("cuda"):
-        #     outputs_cls, outputs_seg = model(inputs)
-        outputs_cls, outputs_seg = model(inputs)
+        with torch.amp.autocast("cuda"):
+            outputs_cls, outputs_seg = model(inputs)
 
         # ------------------------------------
 

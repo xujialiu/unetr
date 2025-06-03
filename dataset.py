@@ -11,6 +11,11 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import torch
 from einops import rearrange
 
+MEAN, STD = (
+    (0.423737496137619, 0.2609460651874542, 0.128403902053833),
+    (0.29482534527778625, 0.20167365670204163, 0.13668020069599152),
+)
+
 
 def get_weighted_sampler(dataset):
     sample_weights = dataset.sample_weights
@@ -22,16 +27,20 @@ def get_weighted_sampler(dataset):
     return weighted_sampler
 
 
-def build_transform(is_train, mean=[0, 0, 0], std=[1, 1, 1], img_size=224):
+def build_transform(is_train, mean=MEAN, std=STD, img_size=224):
 
     if is_train == "train":
 
         transform = [
-            
             # 几何变换
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
-            A.RandomRotate90(p=0.5),
+            A.Rotate(
+                p=0.5,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+                mask_value=0,
+            ),
             # 仿射变换
             A.ShiftScaleRotate(
                 shift_limit=0.1,
@@ -44,16 +53,16 @@ def build_transform(is_train, mean=[0, 0, 0], std=[1, 1, 1], img_size=224):
                 p=0.5,
             ),
             # 弹性变换（对医学图像特别有用）
-            A.ElasticTransform(
-                alpha=120,
-                sigma=120 * 0.05,
-                alpha_affine=120 * 0.03,
-                interpolation=cv2.INTER_CUBIC,
-                border_mode=cv2.BORDER_CONSTANT,
-                value=0,
-                mask_value=0,
-                p=0.3,
-            ),
+            # A.ElasticTransform(
+            #     alpha=120,
+            #     sigma=120 * 0.05,
+            #     alpha_affine=120 * 0.03,
+            #     interpolation=cv2.INTER_CUBIC,
+            #     border_mode=cv2.BORDER_CONSTANT,
+            #     value=0,
+            #     mask_value=0,
+            #     p=0.3,
+            # ),
             # 网格畸变
             A.GridDistortion(
                 num_steps=5,
@@ -64,12 +73,11 @@ def build_transform(is_train, mean=[0, 0, 0], std=[1, 1, 1], img_size=224):
                 mask_value=0,
                 p=0.3,
             ),
-            
             # 调整大小
             A.RandomResizedCrop(
                 height=img_size,
                 width=img_size,
-                scale=(0.3, 1.0),
+                scale=(0.33, 1.0),
                 ratio=(0.75, 1.3333),
                 interpolation=cv2.INTER_CUBIC,
             ),
@@ -79,7 +87,99 @@ def build_transform(is_train, mean=[0, 0, 0], std=[1, 1, 1], img_size=224):
                     A.RandomBrightnessContrast(
                         brightness_limit=0.2, contrast_limit=0.2, p=1
                     ),
-                    A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=1),
+                    A.RandomGamma(gamma_limit=(80, 120), p=1),
+                ],
+                p=0.5,
+            ),
+            # 噪声
+            A.OneOf(
+                [
+                    A.GaussNoise(var_limit=(10.0, 50.0), p=1),
+                    A.GaussianBlur(blur_limit=(3, 7), p=1),
+                    A.MedianBlur(blur_limit=5, p=1),
+                ],
+                p=0.3,
+            ),
+            # 归一化
+            A.Normalize(mean=mean, std=std),
+            # 转换为PyTorch张量
+            ToTensorV2(),
+        ]
+        # transform = [
+        #     A.Resize(height=img_size, width=img_size, interpolation=cv2.INTER_CUBIC),
+        #     A.Normalize(mean=mean, std=std),
+        #     ToTensorV2(),
+        # ]
+    else:
+        transform = [
+            A.Resize(height=img_size, width=img_size, interpolation=cv2.INTER_CUBIC),
+            A.Normalize(mean=mean, std=std),
+            ToTensorV2(),
+        ]
+
+    return A.Compose(transform)
+
+
+def build_transform_2(is_train, mean=MEAN, std=STD, img_size=224):
+
+    if is_train == "train":
+
+        transform = [
+            # 几何变换
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.Rotate(
+                p=0.5,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+                mask_value=0,
+            ),
+            # 仿射变换
+            A.ShiftScaleRotate(
+                shift_limit=0.1,
+                scale_limit=0.2,
+                rotate_limit=30,
+                interpolation=cv2.INTER_CUBIC,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+                mask_value=0,
+                p=0.5,
+            ),
+            # 弹性变换（对医学图像特别有用）
+            # A.ElasticTransform(
+            #     alpha=120,
+            #     sigma=120 * 0.05,
+            #     alpha_affine=120 * 0.03,
+            #     interpolation=cv2.INTER_CUBIC,
+            #     border_mode=cv2.BORDER_CONSTANT,
+            #     value=0,
+            #     mask_value=0,
+            #     p=0.3,
+            # ),
+            # 网格畸变
+            A.GridDistortion(
+                num_steps=5,
+                distort_limit=0.3,
+                interpolation=cv2.INTER_CUBIC,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+                mask_value=0,
+                p=0.3,
+            ),
+            # 调整大小
+            A.RandomResizedCrop(
+                height=img_size,
+                width=img_size,
+                scale=(1, 1.0),
+                ratio=(0.75, 1.3333),
+                interpolation=cv2.INTER_CUBIC,
+            ),
+            # 色彩增强（仅应用于图像，不影响mask）
+            A.OneOf(
+                [
+                    A.RandomBrightnessContrast(
+                        brightness_limit=0.2, contrast_limit=0.2, p=1
+                    ),
                     A.RandomGamma(gamma_limit=(80, 120), p=1),
                 ],
                 p=0.5,
@@ -153,6 +253,8 @@ class MyDataset(Dataset):
 
         mask_paths = [mask_path / file_name for mask_path in self.list_path_root_mask]
 
+        file_stem = img_path.stem
+
         # img = io.imread(img_path)
         # list_mask = [io.imread(mask_path, as_gray=True) > 0 for mask_path in mask_paths]
 
@@ -176,7 +278,7 @@ class MyDataset(Dataset):
         # img.shape: (B, c, 224, 224), mask.shape: (B, 224, 224, 4)
         mask = rearrange(mask, "h w c -> c h w")
 
-        return img, mask, label, file_name
+        return img, mask, label, file_stem
 
     def __len__(self):
         return len(self.df)

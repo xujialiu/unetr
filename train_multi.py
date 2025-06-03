@@ -25,18 +25,12 @@ from einops import asnumpy
 import pandas as pd
 from sklearn import metrics
 
-
-# import transforms as self_transforms
-# from loader import ImageFolder
 from dataset import MyDataset, build_transform, get_weighted_sampler
-
-from loss import MultiLabelSegmentationLoss
 
 import ast
 import numpy as np
 import misc
 
-from vitunetr import vit_unetr_base, vit_unetr_large
 from misc import NativeScalerWithGradNormCount as NativeScaler
 
 from monai.losses.dice import DiceLoss, DiceFocalLoss
@@ -69,7 +63,9 @@ def main(args):
     output_path = result_path / args.checkpoint_dir
     args.metrics_path = result_path / args.metrics_folder
 
-    print(f"{args}".replace(", ", ",\n"))
+    dict_args = args.__dict__.copy()
+    for key in sorted(dict_args.keys()):
+        print(f'"{key}": "{dict_args[key]}"')
 
     if not Path(output_path).exists():
         Path(output_path).mkdir(parents=True)
@@ -140,6 +136,12 @@ def main(args):
     )
 
     # ============ building network ... ============
+
+    if args.multiple_unetr:
+        from vitunetr_multi import vit_unetr_base, vit_unetr_large
+    else:
+        from vitunetr import vit_unetr_base, vit_unetr_large
+
     if args.arch == "vit_unetr_base":
         model_arch = vit_unetr_base
     elif args.arch == "vit_unetr_large":
@@ -182,7 +184,7 @@ def main(args):
 
     # eval
     elif args.eval:
-        config_lora = LoraConfig(
+        config_lora_1 = LoraConfig(
             r=args.lora_rank,  # LoRA的秩
             lora_alpha=args.lora_alpha,  # LoRA的alpha参数, scaling=alpha/r
             target_modules=target_modules,  # 需要应用LoRA的模块名称
@@ -190,7 +192,7 @@ def main(args):
             bias=args.lora_bias,
             # task_type="FEATURE_EXTRACTION",
         )
-        model = get_peft_model(model, config_lora, adapter_name="lora_1", mixed=True)
+        model = get_peft_model(model, config_lora_1, adapter_name="lora_1", mixed=True)
 
         checkpoint = torch.load(args.finetune, map_location="cpu")
         checkpoint_model = checkpoint["model"]
@@ -199,11 +201,12 @@ def main(args):
 
     print(model)
     for name, param in model.named_parameters():
-        if name.startswith("encoder"):
+        if "encoder" in name:
             if "lora" in name:
                 param.requires_grad = True
             else:
                 param.requires_grad = False
+
         elif "decoder" in name:
             param.requires_grad = True
 
@@ -233,7 +236,10 @@ def main(args):
     # 为不同部分设置不同的学习率
     param_groups = [
         {"params": encoder_params, "lr": args.lr},
-        {"params": decoder_params, "lr": args.lr * 10},  # 分割解码器使用更高的学习率
+        {
+            "params": decoder_params,
+            "lr": args.lr * args.lr_seg_weight,
+        },  # 分割解码器使用更高的学习率
         {"params": cls_head_params, "lr": args.lr},
     ]
 
@@ -373,10 +379,11 @@ def train(
         list_loss_seg = []
         list_loss_totals = []
 
-        with torch.amp.autocast("cuda"):
-            outputs_cls, outputs_seg = model(inputs)
+        # with torch.amp.autocast("cuda"):
+        #     outputs_cls, outputs_seg = model(inputs)
+        outputs_cls, outputs_seg = model(inputs)
 
-            # ------------------------------------
+        # ------------------------------------
 
         if (labels.max() >= 3) and (image_count < max_images):  # 保存前5个batch的结果
             idx = torch.argmax(labels)
@@ -602,6 +609,7 @@ def evaluate(
         # compute output
         with torch.cuda.amp.autocast():
             outputs_cls, outputs_seg = model(inputs)
+            outputs_cls_prob = F.softmax(outputs_cls, dim=-1)
 
         # ------------------------------------
         if (labels.max() >= 3) and (image_count < max_images):
@@ -644,6 +652,8 @@ def evaluate(
 
             label = labels[idx]
             mask = masks[idx]
+            output_cls_prob = outputs_cls_prob[idx]
+            
             output_cls = outputs_cls[idx]
             output_seg = outputs_seg[idx]
 
@@ -651,7 +661,6 @@ def evaluate(
             loss_seg = criterion_seg(output_seg, mask)
             loss = loss_seg + loss_cls
 
-            output_cls_prob = F.softmax(output_cls, dim=-1)
             output_cls_pred = output_cls.argmax(dim=-1)
 
             list_names.append(file_names[idx])
@@ -780,6 +789,13 @@ def get_args_parser():
         choices=["vit_unetr_base", "vit_unetr_large"],
         help="Architecture.",
     )
+
+    parser.add_argument(
+        "--multiple_unetr",
+        action="store_true",
+        help="use multiple unetr heads.",
+    )
+
     parser.add_argument(
         "--finetune",
         default="",
@@ -963,6 +979,13 @@ def get_args_parser():
     #     default=2,
     #     help="Number of epochs to wait before resuming normal operation after lr has been reduced (default: 2)"
     # )
+
+    parser.add_argument(
+        "--lr_seg_weight",
+        type=int,
+        default=1,
+        help="weight for segmentation loss in the total loss (default: 1)",
+    )
 
     return parser
 

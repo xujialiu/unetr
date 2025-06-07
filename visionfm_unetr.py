@@ -15,7 +15,7 @@ class ConvBlock(nn.Module):
                 padding=padding,
             ),
             nn.BatchNorm2d(out_c),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
         )
 
     def forward(self, x):
@@ -52,7 +52,6 @@ class UnetrHead(nn.Module):
         self.name = "unetr"
 
         self.base_channel = 32
-        print(f"base channel: {self.base_channel}")
 
         # add at 09/15
         if self.dropout_rate > 0:

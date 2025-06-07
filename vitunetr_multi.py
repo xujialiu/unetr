@@ -12,6 +12,71 @@ from visionfm_unetr import UnetrHead
 # from unetr_head import UnetrHead
 
 
+class ClsHead(nn.Module):
+    """
+    Wu, Jianfang, et al. "Vision Transformer‐based recognition of diabetic retinopathy grade." Medical Physics 48.12 (2021): 7850-7863.
+    """
+
+    def __init__(self, embed_dim, num_classes, layers=3):
+        super(ClsHead, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_classes = num_classes
+        self.layers = (
+            layers  # default is 3 layers, we test different layers for retfound
+        )
+
+        if self.layers == 3:
+            channels = [
+                self.embed_dim,
+                self.embed_dim // 2,
+                self.embed_dim // 4,
+                self.num_classes,
+            ]
+            self.classifier = nn.Sequential(
+                nn.Linear(channels[0], channels[1]),
+                nn.GELU(),
+                nn.Dropout(p=0.1),
+                nn.Linear(channels[1], channels[2]),
+                nn.GELU(),
+                nn.Dropout(p=0.1),
+                nn.Linear(channels[2], channels[3]),
+            )
+        elif self.layers == 2:
+            channels = [self.embed_dim, self.embed_dim // 4, self.num_classes]
+            self.classifier = nn.Sequential(
+                nn.Linear(channels[0], channels[1]),
+                nn.GELU(),
+                nn.Dropout(p=0.1),
+                nn.Linear(channels[1], channels[2]),
+            )
+        elif self.layers == 1:
+            channels = [self.embed_dim, self.num_classes]
+            self.classifier = nn.Sequential(
+                nn.Linear(channels[0], channels[1]),
+            )
+        self.channel_bn = nn.BatchNorm2d(
+            self.embed_dim,
+            eps=1e-6,  # default 1e-6
+            momentum=0.99,  # default: 0.99
+        )
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.classifier:
+            if isinstance(m, nn.Linear):
+                nn.init.constant_(m.bias.data, 0.0)
+                nn.init.normal_(m.weight.data, mean=0.0, std=0.01)
+
+    def forward(self, x):
+        if len(x.shape) == 2:
+            x = x.unsqueeze(2).unsqueeze(3)
+        # flatten
+        x = self.channel_bn(x)
+        x = x.view(x.size(0), -1)
+        # linear layer
+        return self.classifier(x)
+
+
 class ViTUNETR(nn.Module):
     """
     Vision Transformer with UNETR decoder head for segmentation tasks.
@@ -66,9 +131,9 @@ class ViTUNETR(nn.Module):
         self.feature_layers = feature_layers
 
         # Ensure feature_layers are sorted and valid
-        assert all(
-            1 <= layer <= depth for layer in feature_layers
-        ), f"feature_layers must be between 1 and {depth}"
+        assert all(1 <= layer <= depth for layer in feature_layers), (
+            f"feature_layers must be between 1 and {depth}"
+        )
         assert len(feature_layers) == 4, "UNETR head expects exactly 4 feature maps"
 
         # Create ViT encoder
@@ -76,7 +141,7 @@ class ViTUNETR(nn.Module):
             img_size=img_size,
             patch_size=patch_size,
             in_chans=in_chans,
-            num_classes=num_classes_cls,  # No classification head
+            num_classes=0,  # No classification head
             embed_dim=embed_dim,
             depth=depth,
             num_heads=num_heads,
@@ -101,6 +166,8 @@ class ViTUNETR(nn.Module):
                 for _ in range(num_classes_seg)
             ]
         )
+        norm_layer = partial(nn.LayerNorm, eps=1e-6)
+        self.head = ClsHead(embed_dim=embed_dim, num_classes=num_classes_cls, layers=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -115,7 +182,7 @@ class ViTUNETR(nn.Module):
         """
         # Extract hierarchical features from ViT
         # features = self.extract_features(x)
-        cls, list_intermediate_output = self.encoder(x)
+        cls_token, list_intermediate_output = self.encoder(x)
 
         list_features = [
             list_intermediate_output[idx - 1][:, 1:] for idx in self.feature_layers
@@ -123,14 +190,21 @@ class ViTUNETR(nn.Module):
 
         # Process each class with its own head
         seg_outputs = []
-        for head in self.decoder_heads:
-            class_seg = head(list_features, x)  # Shape: [B, 1, H, W]
+        for decoder_head in self.decoder_heads:
+            class_seg = decoder_head(list_features, x)  # Shape: [B, 1, H, W]
             seg_outputs.append(class_seg)
 
         # Combine outputs from all heads
         seg = torch.cat(seg_outputs, dim=1)  # Shape: [B, num_classes_seg, H, W]
 
+        cls = self.head(cls_token)
+
         return cls, seg
+
+    def forward_cls(self, x):
+        cls_token, list_intermediate_output = self.encoder(x)
+        cls = self.head(cls_token)
+        return cls
 
 
 def vit_unetr_base(

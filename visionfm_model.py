@@ -136,7 +136,6 @@ class Attention(nn.Module):
             attn = None
             x = rearrange(out, "b h n d -> b n (h d)")
         else:
-
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
@@ -289,8 +288,9 @@ class VisionTransformer(nn.Module):
             ]
         )
 
-        self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
-        self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
+        # self.norm = nn.Identity() if use_mean_pooling else norm_layer(embed_dim)
+        # self.fc_norm = norm_layer(embed_dim) if use_mean_pooling else None
+        self.norm = norm_layer(embed_dim)
 
         # Classifier head
         self.head = (
@@ -352,19 +352,6 @@ class VisionTransformer(nn.Module):
 
         return self.pos_drop(x)
 
-    def forward_features(self, x):
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)  # return [2*B, 197, 384], two global crops
-        x = x.mean(dim=1)
-        return x
-
-    def forward_cls(self, x):
-        x = self.prepare_tokens(x)
-        x = self.forward_features(x)
-        x = self.head(x)
-        return x
-
     def forward_features_with_intermediate(self, x):
         # we return the output tokens from the `n` last blocks
         list_intermediate_output = []
@@ -373,15 +360,12 @@ class VisionTransformer(nn.Module):
             x = blk(x)
             list_intermediate_output.append(self.norm(x))
 
-        x = self.norm(x)
-        x = x.mean(dim=1)
+        x = self.norm(x[:, 1])
         return x, list_intermediate_output
 
     def forward(self, x):
         x = self.prepare_tokens(x)
         x, list_intermediate_output = self.forward_features_with_intermediate(x)
-        x = self.head(x)
-        # torch.Size([1, 197, 768])
         return x, list_intermediate_output
 
 
@@ -409,123 +393,3 @@ def vit_large(patch_size=16, **kwargs):
         **kwargs,
     )
     return model
-
-
-if __name__ == "__main__":
-    import os
-
-    # 设置随机种子
-    torch.manual_seed(42)
-
-    # 检查是否有GPU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # 创建模型
-    print("Creating ViT-Base model...")
-    model = vit_large(
-        img_size=224,
-        patch_size=16,
-        num_classes=1000,  # ImageNet classes
-        use_flash=False,
-    )
-
-    # 将模型移到设备上
-    model = model.to(device)
-
-    # 打印模型信息
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-
-    # 创建随机输入
-    batch_size = 2
-    dummy_input = torch.randn(batch_size, 3, 224, 224).to(device)
-
-    # 测试前向传播
-    print("\nTesting forward pass...")
-    model.eval()
-    with torch.no_grad():
-        # 测试只返回最终输出
-        output = model.forward_cls(dummy_input)
-        print(f"Output shape (classification): {output.shape}")
-
-        # 测试返回中间层输出
-        output, intermediates = model(dummy_input)
-        print(f"Output shape with intermediates: {output.shape}")
-        print(f"Number of intermediate outputs: {len(intermediates)}")
-        if intermediates:
-            print(f"First intermediate output shape: {intermediates[0].shape}")
-
-    # 加载checkpoint（如果存在）
-    checkpoint_path = "/data_A/xujialiu/checkpoints/foundation_model_weights/my_VFM_Fundus_weights.pth"
-    if os.path.exists(checkpoint_path):
-        print(f"\nLoading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-
-        # 处理不同的checkpoint格式
-        if "model" in checkpoint:
-            state_dict = checkpoint["model"]
-        elif "state_dict" in checkpoint:
-            state_dict = checkpoint["state_dict"]
-        else:
-            state_dict = checkpoint
-
-        # 加载权重
-        # msg = model.load_state_dict(state_dict, strict=False)
-        # print(msg)
-
-        print("Checkpoint loaded successfully!")
-
-        # 如果checkpoint包含其他信息
-        if "epoch" in checkpoint:
-            print(f"Checkpoint epoch: {checkpoint['epoch']}")
-        if "best_acc" in checkpoint:
-            print(f"Best accuracy: {checkpoint['best_acc']}")
-    else:
-        print(f"\nNo checkpoint found at {checkpoint_path}")
-        print("You can save a checkpoint using:")
-        print(
-            "torch.save({'model': model.state_dict(), 'epoch': epoch}, checkpoint_path)"
-        )
-
-    from peft import LoraConfig, get_peft_model
-
-    config_lora = LoraConfig(
-        r=4,  # LoRA的秩
-        lora_alpha=8,  # LoRA的alpha参数, scaling=alpha/r
-        target_modules=["qkv"],  # 需要应用LoRA的模块名称
-        # target_modules="all-linear",
-        lora_dropout=0.1,
-        bias=None,
-        task_type="FEATURE_EXTRACTION",
-        # task_type="CAUSAL_LM"
-    )
-    get_peft_model(model, config_lora)
-
-    # 测试不同输入尺寸（测试位置编码插值）
-    print("\nTesting different input sizes...")
-    for size in [224, 384]:
-        test_input = torch.randn(1, 3, size, size).to(device)
-        with torch.no_grad():
-            output = model.forward(test_input)
-            print(f"Input size {size}x{size} -> Output shape: {output[0].shape}")
-
-    # 保存示例checkpoint
-    print("\nSaving example checkpoint...")
-    example_checkpoint = {
-        "model": model.state_dict(),
-        "epoch": 0,
-        "config": {
-            "img_size": 224,
-            "patch_size": 16,
-            "embed_dim": 768,
-            "depth": 12,
-            "num_heads": 12,
-            "mlp_ratio": 4,
-            "num_classes": 1000,
-        },
-    }
-    torch.save(example_checkpoint, "vit_base_example.pth")
-    print("Example checkpoint saved as 'vit_base_example.pth'")

@@ -250,18 +250,6 @@ def main(args):
 
     loss_scaler = NativeScaler()
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",  # 监控指标越小越好
-        factor=0.5,  # 学习率衰减因子
-        patience=5,  # 等待多少个epoch
-        verbose=True,  # 打印学习率变化信息
-        threshold=1e-4,  # 改善的最小阈值
-        threshold_mode="rel",  # 相对阈值模式
-        cooldown=2,  # 调整后的冷却期
-        min_lr=1e-8,  # 最小学习率
-    )
-
     criterion_cls = nn.CrossEntropyLoss()
     criterion_seg = DiceFocalLoss(
         sigmoid=True,
@@ -313,11 +301,8 @@ def main(args):
             args=args,
         )
 
-        scheduler.step(val_loss_cls)
-
         # 在每个epoch后添加
-        print(f"Epoch {epoch}: Current LR = {optimizer.param_groups[0]['lr']}")
-        print(f"Val loss cls: {val_loss_cls}, Scheduler best: {scheduler.best}")
+        print(f"Epoch {epoch}: Current LR = {optimizer.param_groups[2]['lr']}")
 
         # 记录当前学习率到tensorboard
         current_lr = optimizer.param_groups[0]["lr"]
@@ -366,12 +351,11 @@ def train(
             header,
         )
     ):
-
         # we use a per iteration (instead of per epoch) lr scheduler
-        # if data_iter_step % accum_iter == 0:
-        #     lr_sched.adjust_learning_rate(
-        #         optimizer, data_iter_step / len(data_loader) + epoch, args
-        #     )
+        if data_iter_step % accum_iter == 0:
+            lr_sched.adjust_learning_rate(
+                optimizer, data_iter_step / len(data_loader) + epoch, args
+            )
 
         # move to device
         inputs = inputs.to(device, non_blocking=True)
@@ -382,9 +366,22 @@ def train(
         list_loss_seg = []
         list_loss_totals = []
 
-        # with torch.amp.autocast("cuda"):
-        #     outputs_cls, outputs_seg = model(inputs)
-        outputs_cls, outputs_seg = model(inputs)
+        if torch.cuda.is_bf16_supported():
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                outputs_cls, outputs_seg = model(inputs)
+
+                loss_cls = criterion_cls(outputs_cls, labels)
+                loss_seg = criterion_seg(outputs_seg, masks)
+                # loss = loss_cls + 100 * loss_seg
+                loss = loss_cls
+
+        else:
+            outputs_cls, outputs_seg = model(inputs)
+
+            loss_cls = criterion_cls(outputs_cls, labels)
+            loss_seg = criterion_seg(outputs_seg, masks)
+            # loss = loss_cls + 100 * loss_seg
+            loss = loss_cls
 
         # ------------------------------------
 
@@ -421,11 +418,6 @@ def train(
             plt.close()
             image_count += 1
         # ------------------------------------
-
-        loss_cls = criterion_cls(outputs_cls, labels)
-        loss_seg = criterion_seg(outputs_seg, masks)
-        # loss = loss_cls + 100 * loss_seg
-        loss = loss_cls
 
         list_loss_cls.append(asnumpy(loss_cls))
         list_loss_seg.append(asnumpy(loss_seg))
@@ -488,7 +480,6 @@ def test(
     log_writer=None,
     args=None,
 ):
-
     model.eval()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -514,7 +505,6 @@ def test(
     for data_iter_step, (inputs, masks, labels, file_names) in enumerate(
         metric_logger.log_every(data_loader, 10, header)
     ):
-
         ouput_path = Path(args.result_root_path) / args.result_name / "image_with_mask"
 
         if not ouput_path.exists():
@@ -538,7 +528,6 @@ def test(
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
             for mask_idx, mask_name in enumerate(args.mask_folder_names):
-
                 mask = ouputs_seg[idx, mask_idx]
                 mask = torch.sigmoid(mask)
 
@@ -600,7 +589,6 @@ def evaluate(
     for data_iter_step, (inputs, masks, labels, file_names) in enumerate(
         metric_logger.log_every(data_loader, 10, header)
     ):
-
         inputs = inputs.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -652,11 +640,10 @@ def evaluate(
         batch_size = inputs.shape[0]
 
         for idx in range(batch_size):
-
             label = labels[idx]
             mask = masks[idx]
             output_cls_prob = outputs_cls_prob[idx]
-            
+
             output_cls = outputs_cls[idx]
             output_seg = outputs_seg[idx]
 

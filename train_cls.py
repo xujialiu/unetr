@@ -598,9 +598,8 @@ def evaluate(
         list_batch_loss_totals = []
 
         # compute output
-        with torch.cuda.amp.autocast():
-            outputs_cls, outputs_seg = model(inputs)
-            outputs_cls_prob = F.softmax(outputs_cls, dim=-1)
+        outputs_cls, outputs_seg = model(inputs)
+        outputs_cls_prob = F.softmax(outputs_cls, dim=-1)
 
         # ------------------------------------
         if (labels.max() >= 3) and (image_count < max_images):

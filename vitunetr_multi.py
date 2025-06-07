@@ -166,7 +166,6 @@ class ViTUNETR(nn.Module):
                 for _ in range(num_classes_seg)
             ]
         )
-        norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.head = ClsHead(embed_dim=embed_dim, num_classes=num_classes_cls, layers=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -237,32 +236,3 @@ def vit_unetr_large(
     )
     return model
 
-
-if __name__ == "__main__":
-    # Test the combined model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Create model
-    model = vit_unetr_base(
-        num_classes_seg=2,  # Binary segmentation
-        num_classes_cls=2,  # Binary classification
-    ).to(device)
-
-    # Print model info
-    total_params = sum(p.numel() for p in model.parameters())
-    encoder_params = sum(p.numel() for p in model.encoder.parameters())
-    decoder_params = sum(p.numel() for p in model.decoder.parameters())
-
-    print(f"Total parameters: {total_params:,}")
-    print(f"Encoder parameters: {encoder_params:,}")
-    print(f"Decoder parameters: {decoder_params:,}")
-
-    # Test forward pass
-    batch_size = 2
-    dummy_input = torch.randn(batch_size, 3, 224, 224).to(device)
-
-    with torch.no_grad():
-        output = model(dummy_input)
-        print(f"\nInput shape: {dummy_input.shape}")
-        print(f"Output shape: {output[0].shape, output[1].shape}")

@@ -158,7 +158,6 @@ def main(args):
     model.to(device=args.device)
 
     # apply lora
-
     if args.lora_position == "qkv":
         target_modules = ["qkv"]
 
@@ -234,12 +233,10 @@ def main(args):
             encoder_params.append(param)
 
     # 为不同部分设置不同的学习率
+    # 分割解码器使用更高的学习率
     param_groups = [
         {"params": encoder_params, "lr": args.lr},
-        {
-            "params": decoder_params,
-            "lr": args.lr * args.lr_seg_weight,
-        },  # 分割解码器使用更高的学习率
+        {"params": decoder_params, "lr": args.lr * args.lr_seg_weight},
         {"params": cls_head_params, "lr": args.lr},
     ]
 
@@ -363,7 +360,6 @@ def train(
             header,
         )
     ):
-
         # we use a per iteration (instead of per epoch) lr scheduler
         # if data_iter_step % accum_iter == 0:
         #     lr_sched.adjust_learning_rate(
@@ -379,8 +375,22 @@ def train(
         list_loss_seg = []
         list_loss_totals = []
 
-        with torch.amp.autocast("cuda"):
+        if torch.cuda.is_bf16_supported():
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                outputs_cls, outputs_seg = model(inputs)
+
+                loss_cls = criterion_cls(outputs_cls, labels)
+                loss_seg = criterion_seg(outputs_seg, masks)
+                # loss = loss_cls + 100 * loss_seg
+                loss = loss_seg
+
+        else:
             outputs_cls, outputs_seg = model(inputs)
+
+            loss_cls = criterion_cls(outputs_cls, labels)
+            loss_seg = criterion_seg(outputs_seg, masks)
+            # loss = loss_cls + 100 * loss_seg
+            loss = loss_seg
 
         # ------------------------------------
 
@@ -417,11 +427,6 @@ def train(
             plt.close()
             image_count += 1
         # ------------------------------------
-
-        loss_cls = criterion_cls(outputs_cls, labels)
-        loss_seg = criterion_seg(outputs_seg, masks)
-        # loss = loss_cls + 100 * loss_seg
-        loss = loss_seg
 
         list_loss_cls.append(asnumpy(loss_cls))
         list_loss_seg.append(asnumpy(loss_seg))
@@ -484,7 +489,6 @@ def test(
     log_writer=None,
     args=None,
 ):
-
     model.eval()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -510,7 +514,6 @@ def test(
     for data_iter_step, (inputs, masks, labels, file_names) in enumerate(
         metric_logger.log_every(data_loader, 10, header)
     ):
-
         ouput_path = Path(args.result_root_path) / args.result_name / "image_with_mask"
 
         if not ouput_path.exists():
@@ -534,7 +537,6 @@ def test(
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
             for mask_idx, mask_name in enumerate(args.mask_folder_names):
-
                 mask = ouputs_seg[idx, mask_idx]
                 mask = torch.sigmoid(mask)
 
@@ -596,7 +598,6 @@ def evaluate(
     for data_iter_step, (inputs, masks, labels, file_names) in enumerate(
         metric_logger.log_every(data_loader, 10, header)
     ):
-
         inputs = inputs.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
@@ -605,10 +606,8 @@ def evaluate(
         list_batch_loss_seg = []
         list_batch_loss_totals = []
 
-        # compute output
-        with torch.cuda.amp.autocast():
-            outputs_cls, outputs_seg = model(inputs)
-            outputs_cls_prob = F.softmax(outputs_cls, dim=-1)
+        outputs_cls, outputs_seg = model(inputs)
+        outputs_cls_prob = F.softmax(outputs_cls, dim=-1)
 
         # ------------------------------------
         if (labels.max() >= 3) and (image_count < max_images):
@@ -648,11 +647,10 @@ def evaluate(
         batch_size = inputs.shape[0]
 
         for idx in range(batch_size):
-
             label = labels[idx]
             mask = masks[idx]
             output_cls_prob = outputs_cls_prob[idx]
-            
+
             output_cls = outputs_cls[idx]
             output_seg = outputs_seg[idx]
 
